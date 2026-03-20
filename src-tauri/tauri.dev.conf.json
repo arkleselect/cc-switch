@@ -1,0 +1,11 @@
+{
+  "productName": "CC Switch Dev",
+  "identifier": "com.ccswitch.desktop.dev",
+  "app": {
+    "windows": [
+      {
+        "title": "CC Switch Dev"
+      }
+    ]
+  }
+}

@@ -1,0 +1,777 @@
+import { useEffect, useMemo, useState, useRef } from "react";
+import { useTranslation } from "react-i18next";
+import { motion, AnimatePresence } from "framer-motion";
+import { toast } from "sonner";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  Plus,
+  Settings,
+  ArrowLeft,
+} from "lucide-react";
+import type { Provider, VisibleApps } from "@/types";
+import type { EnvConflict } from "@/types/env";
+import { useProvidersQuery, useSettingsQuery } from "@/lib/query";
+import {
+  providersApi,
+  settingsApi,
+  type AppId,
+  type ProviderSwitchEvent,
+} from "@/lib/api";
+import { checkAllEnvConflicts, checkEnvConflicts } from "@/lib/api/env";
+import { useProviderActions } from "@/hooks/useProviderActions";
+import { useAutoCompact } from "@/hooks/useAutoCompact";
+import { useLastValidValue } from "@/hooks/useLastValidValue";
+import { extractErrorMessage } from "@/utils/errorUtils";
+import { isTextEditableTarget } from "@/utils/domUtils";
+import { isWindows, isLinux } from "@/lib/platform";
+import { AppSwitcher } from "@/components/AppSwitcher";
+import { ProviderList } from "@/components/providers/ProviderList";
+import { AddProviderDialog } from "@/components/providers/AddProviderDialog";
+import { EditProviderDialog } from "@/components/providers/EditProviderDialog";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { SettingsPage } from "@/components/settings/SettingsPage";
+import { EnvWarningBanner } from "@/components/env/EnvWarningBanner";
+import UsageScriptModal from "@/components/UsageScriptModal";
+import { DeepLinkImportDialog } from "@/components/DeepLinkImportDialog";
+import { Button } from "@/components/ui/button";
+
+type View = "providers" | "settings";
+
+interface WebDavSyncStatusUpdatedPayload {
+  source?: string;
+  status?: string;
+  error?: string;
+}
+
+const DRAG_BAR_HEIGHT = isWindows() || isLinux() ? 0 : 28; // px
+const HEADER_HEIGHT = 64; // px
+const CONTENT_TOP_OFFSET = DRAG_BAR_HEIGHT + HEADER_HEIGHT;
+
+const STORAGE_KEY = "cc-switch-last-app";
+const VALID_APPS: AppId[] = ["claude", "codex"];
+
+const getInitialApp = (): AppId => {
+  const saved = localStorage.getItem(STORAGE_KEY) as AppId | null;
+  if (saved && VALID_APPS.includes(saved)) {
+    return saved;
+  }
+  return "claude";
+};
+
+const VIEW_STORAGE_KEY = "cc-switch-last-view";
+const VALID_VIEWS: View[] = ["providers", "settings"];
+
+const getInitialView = (): View => {
+  const saved = localStorage.getItem(VIEW_STORAGE_KEY) as View | null;
+  if (saved && VALID_VIEWS.includes(saved)) {
+    return saved;
+  }
+  return "providers";
+};
+
+function App() {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+
+  const [activeApp, setActiveApp] = useState<AppId>(getInitialApp);
+  const [currentView, setCurrentView] = useState<View>(getInitialView);
+  const [settingsDefaultTab, setSettingsDefaultTab] = useState("general");
+  const [isAddOpen, setIsAddOpen] = useState(false);
+
+  useEffect(() => {
+    localStorage.setItem(VIEW_STORAGE_KEY, currentView);
+  }, [currentView]);
+
+  const { data: settingsData } = useSettingsQuery();
+  const visibleApps: VisibleApps = settingsData?.visibleApps ?? {
+    claude: true,
+    codex: true,
+    gemini: false,
+    opencode: false,
+    openclaw: false,
+  };
+
+  const getFirstVisibleApp = (): AppId => {
+    if (visibleApps.claude) return "claude";
+    if (visibleApps.codex) return "codex";
+    return "claude"; // fallback
+  };
+
+  useEffect(() => {
+    if (!visibleApps[activeApp]) {
+      setActiveApp(getFirstVisibleApp());
+    }
+  }, [visibleApps, activeApp]);
+
+  const [editingProvider, setEditingProvider] = useState<Provider | null>(null);
+  const [usageProvider, setUsageProvider] = useState<Provider | null>(null);
+  const [confirmAction, setConfirmAction] = useState<{
+    provider: Provider;
+    action: "remove" | "delete";
+  } | null>(null);
+  const [envConflicts, setEnvConflicts] = useState<EnvConflict[]>([]);
+  const [showEnvBanner, setShowEnvBanner] = useState(false);
+
+  const effectiveEditingProvider = useLastValidValue(editingProvider);
+  const effectiveUsageProvider = useLastValidValue(usageProvider);
+
+  const toolbarRef = useRef<HTMLDivElement>(null);
+  const isToolbarCompact = useAutoCompact(toolbarRef);
+
+  const addActionButtonClass =
+    "h-9 rounded-xl border border-white/10 bg-white/[0.06] px-3 text-white shadow-[0_10px_30px_rgba(0,0,0,0.28)] backdrop-blur-sm transition-colors hover:border-white/15 hover:bg-white/[0.1]";
+  const isProxyRunning = false;
+  const isCurrentAppTakeoverActive = false;
+  const activeProviderId = undefined;
+
+  const { data, isLoading, refetch } = useProvidersQuery(activeApp, {});
+  const providers = useMemo(() => data?.providers ?? {}, [data]);
+  const currentProviderId = data?.currentProviderId ?? "";
+
+  const {
+    addProvider,
+    updateProvider,
+    switchProvider,
+    deleteProvider,
+    saveUsageScript,
+  } = useProviderActions(activeApp);
+
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+
+    const setupListener = async () => {
+      try {
+        unsubscribe = await providersApi.onSwitched(
+          async (event: ProviderSwitchEvent) => {
+            if (event.appType === activeApp) {
+              await refetch();
+            }
+          },
+        );
+      } catch (error) {
+        console.error("[App] Failed to subscribe provider switch event", error);
+      }
+    };
+
+    setupListener();
+    return () => {
+      unsubscribe?.();
+    };
+  }, [activeApp, refetch]);
+
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+
+    const setupListener = async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        unsubscribe = await listen("universal-provider-synced", async () => {
+          await queryClient.invalidateQueries({ queryKey: ["providers"] });
+          try {
+            await providersApi.updateTrayMenu();
+          } catch (error) {
+            console.error("[App] Failed to update tray menu", error);
+          }
+        });
+      } catch (error) {
+        console.error(
+          "[App] Failed to subscribe universal-provider-synced event",
+          error,
+        );
+      }
+    };
+
+    setupListener();
+    return () => {
+      unsubscribe?.();
+    };
+  }, [queryClient]);
+
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    let active = true;
+
+    const setupListener = async () => {
+      try {
+        const off = await listen(
+          "webdav-sync-status-updated",
+          async (event) => {
+            const payload = (event.payload ??
+              {}) as WebDavSyncStatusUpdatedPayload;
+            await queryClient.invalidateQueries({ queryKey: ["settings"] });
+
+            if (payload.source !== "auto" || payload.status !== "error") {
+              return;
+            }
+
+            toast.error(
+              t("settings.webdavSync.autoSyncFailedToast", {
+                error: payload.error || t("common.unknown"),
+              }),
+            );
+          },
+        );
+        if (!active) {
+          off();
+          return;
+        }
+        unsubscribe = off;
+      } catch (error) {
+        console.error(
+          "[App] Failed to subscribe webdav-sync-status-updated event",
+          error,
+        );
+      }
+    };
+
+    void setupListener();
+    return () => {
+      active = false;
+      unsubscribe?.();
+    };
+  }, [queryClient, t]);
+
+  useEffect(() => {
+    const checkEnvOnStartup = async () => {
+      try {
+        const allConflicts = await checkAllEnvConflicts();
+        const flatConflicts = Object.values(allConflicts).flat();
+
+        if (flatConflicts.length > 0) {
+          setEnvConflicts(flatConflicts);
+          const dismissed = sessionStorage.getItem("env_banner_dismissed");
+          if (!dismissed) {
+            setShowEnvBanner(true);
+          }
+        }
+      } catch (error) {
+        console.error(
+          "[App] Failed to check environment conflicts on startup:",
+          error,
+        );
+      }
+    };
+
+    checkEnvOnStartup();
+  }, []);
+
+  useEffect(() => {
+    const checkMigration = async () => {
+      try {
+        const migrated = await invoke<boolean>("get_migration_result");
+        if (migrated) {
+          toast.success(
+            t("migration.success", { defaultValue: "配置迁移成功" }),
+            { closeButton: true },
+          );
+        }
+      } catch (error) {
+        console.error("[App] Failed to check migration result:", error);
+      }
+    };
+
+    checkMigration();
+  }, [t]);
+
+  useEffect(() => {
+    const checkSkillsMigration = async () => {
+      try {
+        const result = await invoke<{ count: number; error?: string } | null>(
+          "get_skills_migration_result",
+        );
+        if (result?.error) {
+          toast.error(t("migration.skillsFailed"), {
+            description: t("migration.skillsFailedDescription"),
+            closeButton: true,
+          });
+          console.error("[App] Skills SSOT migration failed:", result.error);
+          return;
+        }
+        if (result && result.count > 0) {
+          toast.success(t("migration.skillsSuccess", { count: result.count }), {
+            closeButton: true,
+          });
+          await queryClient.invalidateQueries({ queryKey: ["skills"] });
+        }
+      } catch (error) {
+        console.error("[App] Failed to check skills migration result:", error);
+      }
+    };
+
+    checkSkillsMigration();
+  }, [t, queryClient]);
+
+  useEffect(() => {
+    const checkEnvOnSwitch = async () => {
+      try {
+        const conflicts = await checkEnvConflicts(activeApp);
+
+        if (conflicts.length > 0) {
+          setEnvConflicts((prev) => {
+            const existingKeys = new Set(
+              prev.map((c) => `${c.varName}:${c.sourcePath}`),
+            );
+            const newConflicts = conflicts.filter(
+              (c) => !existingKeys.has(`${c.varName}:${c.sourcePath}`),
+            );
+            return [...prev, ...newConflicts];
+          });
+          const dismissed = sessionStorage.getItem("env_banner_dismissed");
+          if (!dismissed) {
+            setShowEnvBanner(true);
+          }
+        }
+      } catch (error) {
+        console.error(
+          "[App] Failed to check environment conflicts on app switch:",
+          error,
+        );
+      }
+    };
+
+    checkEnvOnSwitch();
+  }, [activeApp]);
+
+  const currentViewRef = useRef(currentView);
+
+  useEffect(() => {
+    currentViewRef.current = currentView;
+  }, [currentView]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "," && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault();
+        setCurrentView("settings");
+        return;
+      }
+
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+
+      if (document.body.style.overflow === "hidden") return;
+
+      const view = currentViewRef.current;
+      if (view === "providers") return;
+
+      if (isTextEditableTarget(event.target)) return;
+
+      event.preventDefault();
+      setCurrentView("providers");
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, []);
+
+  const handleOpenWebsite = async (url: string) => {
+    try {
+      await settingsApi.openExternal(url);
+    } catch (error) {
+      const detail =
+        extractErrorMessage(error) ||
+        t("notifications.openLinkFailed", {
+          defaultValue: "链接打开失败",
+        });
+      toast.error(detail);
+    }
+  };
+
+  const handleEditProvider = async (provider: Provider) => {
+    await updateProvider(provider);
+    setEditingProvider(null);
+  };
+
+  const handleConfirmAction = async () => {
+    if (!confirmAction) return;
+    const { provider, action } = confirmAction;
+
+    if (action === "remove") {
+      await providersApi.removeFromLiveConfig(provider.id, activeApp);
+      toast.success(
+        t("notifications.removeFromConfigSuccess", {
+          defaultValue: "已从配置移除",
+        }),
+        { closeButton: true },
+      );
+    } else {
+      await deleteProvider(provider.id);
+    }
+    setConfirmAction(null);
+  };
+
+  const generateUniqueOpencodeKey = (
+    originalKey: string,
+    existingKeys: string[],
+  ): string => {
+    const baseKey = `${originalKey}-copy`;
+
+    if (!existingKeys.includes(baseKey)) {
+      return baseKey;
+    }
+
+    let counter = 2;
+    while (existingKeys.includes(`${baseKey}-${counter}`)) {
+      counter++;
+    }
+    return `${baseKey}-${counter}`;
+  };
+
+  const handleDuplicateProvider = async (provider: Provider) => {
+    const newSortIndex =
+      provider.sortIndex !== undefined ? provider.sortIndex + 1 : undefined;
+
+    const duplicatedProvider: Omit<Provider, "id" | "createdAt"> & {
+      providerKey?: string;
+    } = {
+      name: `${provider.name} copy`,
+      settingsConfig: JSON.parse(JSON.stringify(provider.settingsConfig)), // 深拷贝
+      websiteUrl: provider.websiteUrl,
+      category: provider.category,
+      sortIndex: newSortIndex, // 复制原 sortIndex + 1
+      meta: provider.meta
+        ? JSON.parse(JSON.stringify(provider.meta))
+        : undefined, // 深拷贝
+      icon: provider.icon,
+      iconColor: provider.iconColor,
+    };
+
+    if (activeApp === "opencode") {
+      const existingKeys = Object.keys(providers);
+      duplicatedProvider.providerKey = generateUniqueOpencodeKey(
+        provider.id,
+        existingKeys,
+      );
+    }
+
+    if (provider.sortIndex !== undefined) {
+      const updates = Object.values(providers)
+        .filter(
+          (p) =>
+            p.sortIndex !== undefined &&
+            p.sortIndex >= newSortIndex! &&
+            p.id !== provider.id,
+        )
+        .map((p) => ({
+          id: p.id,
+          sortIndex: p.sortIndex! + 1,
+        }));
+
+      if (updates.length > 0) {
+        try {
+          await providersApi.updateSortOrder(updates, activeApp);
+        } catch (error) {
+          console.error("[App] Failed to update sort order", error);
+          toast.error(
+            t("provider.sortUpdateFailed", {
+              defaultValue: "排序更新失败",
+            }),
+          );
+          return; // 如果排序更新失败，不继续添加
+        }
+      }
+    }
+
+    await addProvider(duplicatedProvider);
+  };
+
+  const handleOpenTerminal = async (provider: Provider) => {
+    try {
+      await providersApi.openTerminal(provider.id, activeApp);
+      toast.success(
+        t("provider.terminalOpened", {
+          defaultValue: "终端已打开",
+        }),
+      );
+    } catch (error) {
+      console.error("[App] Failed to open terminal", error);
+      const errorMessage = extractErrorMessage(error);
+      toast.error(
+        t("provider.terminalOpenFailed", {
+          defaultValue: "打开终端失败",
+        }) + (errorMessage ? `: ${errorMessage}` : ""),
+      );
+    }
+  };
+
+  const handleImportSuccess = async () => {
+    try {
+      await queryClient.invalidateQueries({
+        queryKey: ["providers"],
+        refetchType: "all",
+      });
+      await queryClient.refetchQueries({
+        queryKey: ["providers"],
+        type: "all",
+      });
+    } catch (error) {
+      console.error("[App] Failed to refresh providers after import", error);
+      await refetch();
+    }
+    try {
+      await providersApi.updateTrayMenu();
+    } catch (error) {
+      console.error("[App] Failed to refresh tray menu", error);
+    }
+  };
+
+  const renderContent = () => {
+    const content = (() => {
+      switch (currentView) {
+        case "settings":
+          return (
+            <SettingsPage
+              open={true}
+              onOpenChange={() => setCurrentView("providers")}
+              onImportSuccess={handleImportSuccess}
+              defaultTab={settingsDefaultTab}
+            />
+          );
+        default:
+          return (
+            <div className="px-6 flex flex-col flex-1 min-h-0 overflow-hidden">
+              <div className="flex-1 overflow-y-auto overflow-x-hidden pb-12 px-1">
+                <AnimatePresence mode="wait">
+                  <motion.div
+                    key={activeApp}
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.15 }}
+                    className="space-y-4"
+                  >
+                    <ProviderList
+                      providers={providers}
+                      currentProviderId={currentProviderId}
+                      appId={activeApp}
+                      isLoading={isLoading}
+                      isProxyRunning={isProxyRunning}
+                      isProxyTakeover={false}
+                      activeProviderId={activeProviderId}
+                      onSwitch={switchProvider}
+                      onEdit={(provider) => {
+                        setEditingProvider(provider);
+                      }}
+                      onDelete={(provider) =>
+                        setConfirmAction({ provider, action: "delete" })
+                      }
+                      onDuplicate={handleDuplicateProvider}
+                      onConfigureUsage={setUsageProvider}
+                      onOpenWebsite={handleOpenWebsite}
+                      onOpenTerminal={
+                        activeApp === "claude" ? handleOpenTerminal : undefined
+                      }
+                      onCreate={() => setIsAddOpen(true)}
+                    />
+                  </motion.div>
+                </AnimatePresence>
+              </div>
+            </div>
+          );
+      }
+    })();
+
+    return (
+      <AnimatePresence mode="wait">
+        <motion.div
+          key={currentView}
+          className="flex-1 min-h-0"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.2 }}
+        >
+          {content}
+        </motion.div>
+      </AnimatePresence>
+    );
+  };
+
+  return (
+    <div
+      className="flex flex-col h-screen overflow-hidden bg-transparent text-foreground selection:bg-primary/30"
+      style={{ overflowX: "hidden", paddingTop: CONTENT_TOP_OFFSET }}
+    >
+      <div
+        className="fixed top-0 left-0 right-0 z-[60]"
+        data-tauri-drag-region
+        style={{ WebkitAppRegion: "drag", height: DRAG_BAR_HEIGHT } as any}
+      />
+      {showEnvBanner && envConflicts.length > 0 && (
+        <EnvWarningBanner
+          conflicts={envConflicts}
+          onDismiss={() => {
+            setShowEnvBanner(false);
+            sessionStorage.setItem("env_banner_dismissed", "true");
+          }}
+          onDeleted={async () => {
+            try {
+              const allConflicts = await checkAllEnvConflicts();
+              const flatConflicts = Object.values(allConflicts).flat();
+              setEnvConflicts(flatConflicts);
+              if (flatConflicts.length === 0) {
+                setShowEnvBanner(false);
+              }
+            } catch (error) {
+              console.error(
+                "[App] Failed to re-check conflicts after deletion:",
+                error,
+              );
+            }
+          }}
+        />
+      )}
+
+      <header
+        className="fixed z-50 w-full border-b border-white/5 bg-[#17181b]/72 transition-all duration-300 backdrop-blur-md"
+        data-tauri-drag-region
+        style={
+          {
+            WebkitAppRegion: "drag",
+            top: DRAG_BAR_HEIGHT,
+            height: HEADER_HEIGHT,
+          } as any
+        }
+      >
+        <div
+          className="flex h-full items-center justify-between gap-2 px-6"
+          data-tauri-drag-region
+          style={{ WebkitAppRegion: "drag" } as any}
+        >
+          <div
+            className="flex items-center gap-1"
+            style={{ WebkitAppRegion: "no-drag" } as any}
+          >
+            {currentView !== "providers" ? (
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  size="icon"
+                  onClick={() => setCurrentView("providers")}
+                  className="mr-2 rounded-lg"
+                >
+                  <ArrowLeft className="w-4 h-4" />
+                </Button>
+                <h1 className="text-lg font-semibold">{t("settings.title")}</h1>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  onClick={() => {
+                    setSettingsDefaultTab("general");
+                    setCurrentView("settings");
+                  }}
+                  title={t("common.settings")}
+                  className="hover:bg-black/5 dark:hover:bg-white/5"
+                >
+                  <Settings className="w-4 h-4" />
+                </Button>
+              </div>
+            )}
+          </div>
+
+          <div className="flex flex-1 min-w-0 items-center justify-end gap-1.5">
+            <div
+              ref={toolbarRef}
+              className="flex flex-1 min-w-0 overflow-x-hidden items-center"
+            >
+              <div
+                className="flex shrink-0 items-center gap-1.5 ml-auto"
+                style={{ WebkitAppRegion: "no-drag" } as any}
+              >
+                {currentView === "providers" && (
+                  <>
+                    <AppSwitcher
+                      activeApp={activeApp}
+                      onSwitch={setActiveApp}
+                      visibleApps={visibleApps}
+                      compact={isToolbarCompact}
+                    />
+
+                    <Button
+                      onClick={() => setIsAddOpen(true)}
+                      size="icon"
+                      className={`ml-2 ${addActionButtonClass}`}
+                    >
+                      <Plus className="w-5 h-5" />
+                    </Button>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main className="flex-1 min-h-0 flex flex-col overflow-y-auto animate-fade-in">
+        {renderContent()}
+      </main>
+
+      <AddProviderDialog
+        open={isAddOpen}
+        onOpenChange={setIsAddOpen}
+        appId={activeApp}
+        onSubmit={addProvider}
+      />
+
+      <EditProviderDialog
+        open={Boolean(editingProvider)}
+        provider={effectiveEditingProvider}
+        onOpenChange={(open) => {
+          if (!open) {
+            setEditingProvider(null);
+          }
+        }}
+        onSubmit={handleEditProvider}
+        appId={activeApp}
+        isProxyTakeover={isProxyRunning && isCurrentAppTakeoverActive}
+      />
+
+      {effectiveUsageProvider && (
+        <UsageScriptModal
+          key={effectiveUsageProvider.id}
+          provider={effectiveUsageProvider}
+          appId={activeApp}
+          isOpen={Boolean(usageProvider)}
+          onClose={() => setUsageProvider(null)}
+          onSave={(script) => {
+            if (usageProvider) {
+              void saveUsageScript(usageProvider, script);
+            }
+          }}
+        />
+      )}
+
+      <ConfirmDialog
+        isOpen={Boolean(confirmAction)}
+        title={
+          confirmAction?.action === "remove"
+            ? t("confirm.removeProvider")
+            : t("confirm.deleteProvider")
+        }
+        message={
+          confirmAction
+            ? confirmAction.action === "remove"
+              ? t("confirm.removeProviderMessage", {
+                  name: confirmAction.provider.name,
+                })
+              : t("confirm.deleteProviderMessage", {
+                  name: confirmAction.provider.name,
+                })
+            : ""
+        }
+        onConfirm={() => void handleConfirmAction()}
+        onCancel={() => setConfirmAction(null)}
+      />
+
+      <DeepLinkImportDialog />
+    </div>
+  );
+}
+
+export default App;
